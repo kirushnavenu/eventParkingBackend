@@ -1,55 +1,102 @@
-﻿using EventParking.API.Data;
+using EventParking.API.Data;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.DependencyInjection;
 
 namespace EventParking.API.Workers
 {
     public class BookingExpirationWorker : BackgroundService
     {
         private readonly IServiceProvider _serviceProvider;
+        private readonly ILogger<BookingExpirationWorker> _logger;
 
-        public BookingExpirationWorker(IServiceProvider serviceProvider)
+        public BookingExpirationWorker(
+            IServiceProvider serviceProvider,
+            ILogger<BookingExpirationWorker> logger)
         {
             _serviceProvider = serviceProvider;
+            _logger = logger;
         }
 
-        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        protected override async Task ExecuteAsync(
+            CancellationToken stoppingToken)
         {
             while (!stoppingToken.IsCancellationRequested)
             {
-                // Run this check every 1 minute
-                await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
-
-                using var scope = _serviceProvider.CreateScope();
-                var context = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-                // Find all pending bookings where the time has run out
-                var expiredBookings = await context.Bookings
-                    .Where(b => b.Status == "Pending" && b.HoldExpiresAt <= DateTime.UtcNow)
-                    .ToListAsync(stoppingToken);
-
-                foreach (var booking in expiredBookings)
+                try
                 {
-                    booking.Status = "Expired";
+                    using var scope =
+                        _serviceProvider.CreateScope();
 
-                    // Release Seats
-                    var seatsToRelease = await context.BookingSeats
-                        .Include(bs => bs.Seat)
-                        .Where(bs => bs.BookingId == booking.Id)
-                        .ToListAsync(stoppingToken);
-                    foreach (var bs in seatsToRelease) { bs.Seat!.Status = "Available"; }
+                    var context =
+                        scope.ServiceProvider
+                            .GetRequiredService<AppDbContext>();
 
-                    // Release Parking
-                    var parkingToRelease = await context.ParkingReservations
-                        .Include(pr => pr.ParkingSlot)
-                        .FirstOrDefaultAsync(pr => pr.BookingId == booking.Id, stoppingToken);
-                    if (parkingToRelease != null) { parkingToRelease.ParkingSlot!.Status = "Available"; }
+                    var expiredBookings =
+                        await context.Bookings
+                            .Where(b =>
+                                b.Status == "Pending" &&
+                                b.HoldExpiresAt <= DateTime.UtcNow)
+                            .ToListAsync(stoppingToken);
+
+                    foreach (var booking in expiredBookings)
+                    {
+                        booking.Status = "Expired";
+
+                        var seatsToRelease =
+                            await context.BookingSeats
+                                .Include(bs => bs.Seat)
+                                .Where(bs =>
+                                    bs.BookingId == booking.Id)
+                                .ToListAsync(stoppingToken);
+
+                        foreach (var bookingSeat in seatsToRelease)
+                        {
+                            if (bookingSeat.Seat != null)
+                            {
+                                bookingSeat.Seat.Status = "Available";
+                            }
+                        }
+
+                        var parkingToRelease =
+                            await context.ParkingReservations
+                                .Include(pr => pr.ParkingSlot)
+                                .FirstOrDefaultAsync(
+                                    pr => pr.BookingId == booking.Id,
+                                    stoppingToken);
+
+                        if (parkingToRelease?.ParkingSlot != null)
+                        {
+                            parkingToRelease.ParkingSlot.Status =
+                                "Available";
+                        }
+                    }
+
+                    if (expiredBookings.Count > 0)
+                    {
+                        await context.SaveChangesAsync(stoppingToken);
+                    }
+                }
+                catch (OperationCanceledException)
+                    when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(
+                        ex,
+                        "Booking expiration worker failed. Retrying next cycle.");
                 }
 
-                if (expiredBookings.Any())
+                try
                 {
-                    await context.SaveChangesAsync(stoppingToken);
+                    await Task.Delay(
+                        TimeSpan.FromMinutes(1),
+                        stoppingToken);
+                }
+                catch (OperationCanceledException)
+                    when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
                 }
             }
         }
